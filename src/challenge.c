@@ -22,7 +22,7 @@
 #define TIMEOUT_MSG_LENGTH 2
 #define TIMEOUT_MSG_DEFINITION 0x51
 
-typedef enum { IDLE, CHECK_MSG, WAIT_FOR_PAYLOAD, PROCESS_MSG, NUM_OF_STATES } state_t;
+typedef enum { WAIT_FOR_MSG, CHECK_MSG, WAIT_FOR_PAYLOAD, PROCESS_MSG, NUM_OF_STATES } state_t;
 
 typedef struct {
     uint8_t type;
@@ -33,13 +33,13 @@ typedef struct {
 
 typedef state_t state_func_t(data_t* data);
 
-state_t doStateIdle(data_t *data);
+state_t doStateWaitForMessage(data_t *data);
 state_t doStateCheckMsg(data_t *data);
 state_t doStateWaitForPayload(data_t *data);
 state_t doStateProcessMsg(data_t *data);
 
 state_func_t* const stateTable[NUM_OF_STATES] = {
-    doStateIdle,
+    doStateWaitForMessage,
     doStateCheckMsg,
     doStateWaitForPayload,
     doStateProcessMsg
@@ -89,25 +89,16 @@ void challenge_init() {
  * TickType_t ms = xTaskGetTickCount();
  */
 void challenge_run() {
-    state_t cur_state = IDLE;
+    state_t cur_state = WAIT_FOR_MSG;
     data_t data;
     while (1) {
         cur_state = stateTable[cur_state](&data);
     }
 }
 
-state_t doStateIdle(data_t *data) {
-    if (uxQueueMessagesWaiting(dataQueue) == 0) {
-        return IDLE;
-    } else {
-        return CHECK_MSG; 
-    }
-}
-
-void initializeDataForMsg(data_t *data) {
+void initializeDataForMsg(data_t* data) {
     uint8_t newData;
-    if (xQueueReceive(dataQueue, &newData, 0) != pdPASS)
-        console_print("ERROR: failed to receive data queue\n");
+    while (xQueueReceive(dataQueue, &newData, portMAX_DELAY) != pdPASS);
     data->type = newData >> 4;
     data->length = newData & 0xF;
     if (!data->receivedData) {
@@ -117,15 +108,19 @@ void initializeDataForMsg(data_t *data) {
     data->bytesReceived = 0;
 }
 
-bool isValidMsgDefinition(data_t *data) {
+state_t doStateWaitForMessage(data_t* data) {
+    initializeDataForMsg(data);
+    return CHECK_MSG;
+}
+
+bool isValidMsgDefinition(data_t* data) {
     return (data->type == EMPTY && data->length == 0) 
         || (data->type == ADD && data->length == 4)
         || (data->type == DELAY && data->length == 3)
         || (data->type == LOG && data->length > 0);
 }
 
-state_t doStateCheckMsg(data_t *data) {
-    initializeDataForMsg(data);
+state_t doStateCheckMsg(data_t* data) {
     if (isValidMsgDefinition(data)) {
         console_print("INFO: Receiving message of type: ");
         if (data->type == EMPTY) console_print("EMPTY\n");
@@ -136,24 +131,21 @@ state_t doStateCheckMsg(data_t *data) {
     } else {
         console_print("ERROR: received message definition which will not be handled: type=%d, length=%d\n",
                       data->type, data->length);
-        return IDLE;
+        return WAIT_FOR_MSG;
     }
 }
 
-state_t doStateWaitForPayload(data_t *data) {
+state_t doStateWaitForPayload(data_t* data) {
     if (data->bytesReceived >= data->length) {
         return PROCESS_MSG;
-    } else if (uxQueueMessagesWaiting(dataQueue) == 0) {
-        return WAIT_FOR_PAYLOAD;
-    } else {
-        uint8_t newData;
-        if (xQueueReceive(dataQueue, &newData, 0) != pdPASS)
-            console_print("ERROR: failed to reveive data queue\n");
-        *(data->receivedData + data->bytesReceived) = newData;
-        ++data->bytesReceived;
-        console_print("INFO: payload received: %d/%d\n", data->bytesReceived, data->length);
-        return WAIT_FOR_PAYLOAD;
     }
+    uint8_t newData;
+    while (xQueueReceive(dataQueue, &newData, 2) != pdPASS)
+      console_print("WARN: waited too long for the payload. The current state might not be correct\n");
+    *(data->receivedData + data->bytesReceived) = newData;
+    ++data->bytesReceived;
+    console_print("INFO: payload received: %d/%d\n", data->bytesReceived, data->length);
+    return WAIT_FOR_PAYLOAD;
 }
 
 void sendEmpty() {
@@ -162,7 +154,7 @@ void sendEmpty() {
     send(&msg, EMPTY_MSG_LENGTH);
 }
 
-void sendResult(data_t *data) {
+void sendResult(data_t* data) {
     uint8_t* receivedData = data->receivedData;
     uint16_t result = (receivedData[0] + receivedData[2] << 8) + receivedData[1] + receivedData[3];
     uint8_t msg[] = { RESULT_MSG_DEFINITION, result >> 8, result & 0xF };
@@ -189,7 +181,7 @@ void printLogMsg(data_t* data) {
     console_print("INFO: Received log message: %s\n", data->receivedData);
 }
 
-state_t doStateProcessMsg(data_t *data) {
+state_t doStateProcessMsg(data_t* data) {
     switch (data->type) {
        case EMPTY:
             sendEmpty();
@@ -206,5 +198,5 @@ state_t doStateProcessMsg(data_t *data) {
         default:
             console_print("ERROR: reached processMsg with unprocessable msg type\n");
     }
-    return IDLE;
+    return WAIT_FOR_MSG;
 }
